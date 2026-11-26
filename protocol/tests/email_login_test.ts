@@ -18,6 +18,7 @@ Deno.test("メール認証はPC用セッションと認証番号を使い、パ�
     const authenticate: PasswordAuthenticator = async (options, init) => {
       assertEquals(init.device, "DESKTOPWIN");
       assertEquals(init.version, undefined);
+      assertEquals(init.legy, { encrypted: false });
       assertEquals(options.email, "test@example.invalid");
       assertEquals(options.password, password);
       assert(/^\d{6}$/.test(options.pincode!));
@@ -133,6 +134,7 @@ Deno.test("PC用トークンを削除せず同じ機種で復元し、QRのAndro
             init.version,
             device === "DESKTOPWIN" ? undefined : "26.6.2",
           );
+          assertEquals(init.legy, { encrypted: false });
           return Promise.resolve({ authToken: token } as Client);
         },
       );

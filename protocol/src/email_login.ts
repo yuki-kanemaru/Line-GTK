@@ -1,5 +1,5 @@
 import { loginWithPassword } from "@evex/linejs";
-import { createAuthStorage } from "./auth.ts";
+import { createAuthStorage, loginInit } from "./auth.ts";
 
 export type PasswordAuthenticator = typeof loginWithPassword;
 
@@ -38,7 +38,7 @@ export async function authenticateEmail(
       password,
       pincode: generateLoginPin(),
       onPincodeRequest: onPin,
-    }, { device: "DESKTOPWIN", storage });
+    }, { ...loginInit("DESKTOPWIN", ""), storage });
   } catch (error) {
     throw new Error(emailLoginError(error));
   }

@@ -6,7 +6,7 @@
 import { Client, TalkMessage } from "@evex/linejs";
 import { fromFileUrl, join } from "@std/path";
 import { atomicWriteJson, ensurePrivateDir } from "./storage.ts";
-import { AuthStore, LineDevice, restoreSession } from "./auth.ts";
+import { AuthStore, LineDevice, restoreSessionWithFallback } from "./auth.ts";
 import { emailLoginError } from "./email_login.ts";
 import { CachePolicy, policyFor } from "./cache_policy.ts";
 import { contactKind, picturePathOf, profileUrl } from "./contacts.ts";
@@ -562,7 +562,16 @@ const connectionRecovery = createConnectionRecovery({
   restore: async (current) => {
     const token = current.authToken;
     const device = await loadAuthDevice();
-    return await restoreSession(token, device, storagePath, LINE_VERSION);
+    const restored = await restoreSessionWithFallback(
+      token,
+      device,
+      storagePath,
+      LINE_VERSION,
+    );
+    if (restored.device !== device) {
+      await saveAuth(restored.client.authToken, restored.device);
+    }
+    return restored.client;
   },
   activate: (next) => {
     client = next;
@@ -2470,8 +2479,14 @@ emitEvent("ready", {
 
 if (bootAuth) {
   try {
-    const device = bootDevice;
-    client = await restoreSession(bootAuth, device, storagePath, LINE_VERSION);
+    const restored = await restoreSessionWithFallback(
+      bootAuth,
+      bootDevice,
+      storagePath,
+      LINE_VERSION,
+    );
+    client = restored.client;
+    const device = restored.device;
     await saveAuth(client.authToken, device);
     const profile = await client.getMyProfile();
     patchE2eeGuards();

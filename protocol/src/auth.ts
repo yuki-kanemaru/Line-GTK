@@ -8,12 +8,38 @@ import {
 } from "./storage.ts";
 
 export type LineDevice = "ANDROID" | "ANDROIDSECONDARY" | "DESKTOPWIN";
+export type LegyEncryptedMode = boolean | "auto";
+
+// 2026-11-18以降、LINEのLEGY暗号化ゲートウェイ(/enc)が404を返すため既定で平文HTTPS経路を使う。
+export function legyOptions(raw?: string): { encrypted: LegyEncryptedMode } {
+  let value = raw;
+  if (value === undefined) {
+    try {
+      value = Deno.env.get("LINE_LEGY_ENCRYPTED");
+    } catch {
+      value = undefined;
+    }
+  }
+  const normalized = value?.trim().toLowerCase();
+  if (normalized === "auto") return { encrypted: "auto" };
+  if (
+    normalized === "1" || normalized === "true" ||
+    normalized === "on" || normalized === "yes"
+  ) {
+    return { encrypted: true };
+  }
+  return { encrypted: false };
+}
 
 // セッションの機種と同じ設定で復元する。PCにはAndroidのバージョンを渡さない。
-export function loginInit(device: LineDevice, androidVersion: string) {
+export function loginInit(
+  device: LineDevice,
+  androidVersion: string,
+  legy = legyOptions(),
+) {
   return device === "DESKTOPWIN"
-    ? { device }
-    : { device, version: androidVersion };
+    ? { device, legy }
+    : { device, version: androidVersion, legy };
 }
 
 export async function createAuthStorage(path: string) {
@@ -34,6 +60,51 @@ export async function restoreSession(
     ...loginInit(device, androidVersion),
     storage: await createAuthStorage(storagePath),
   });
+}
+
+export function isAppTypeMismatchError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.includes("ApplicationType mismatch");
+}
+
+function fallbackDeviceFor(device: LineDevice): LineDevice | null {
+  if (device === "DESKTOPWIN") return "ANDROIDSECONDARY";
+  if (device === "ANDROIDSECONDARY") return "DESKTOPWIN";
+  return null;
+}
+
+// 途中失敗したログインでrefreshTokenとauth-device.txtの機種が食い違った場合を自動修復する。
+export async function restoreSessionWithFallback(
+  token: string,
+  device: LineDevice,
+  storagePath: string,
+  androidVersion: string,
+  authenticate: typeof loginWithAuthToken = loginWithAuthToken,
+): Promise<{
+  client: Awaited<ReturnType<typeof loginWithAuthToken>>;
+  device: LineDevice;
+}> {
+  try {
+    const client = await restoreSession(
+      token,
+      device,
+      storagePath,
+      androidVersion,
+      authenticate,
+    );
+    return { client, device };
+  } catch (error) {
+    const fallback = fallbackDeviceFor(device);
+    if (!fallback || !isAppTypeMismatchError(error)) throw error;
+    const client = await restoreSession(
+      token,
+      fallback,
+      storagePath,
+      androidVersion,
+      authenticate,
+    );
+    return { client, device: fallback };
+  }
 }
 
 export class AuthStore {

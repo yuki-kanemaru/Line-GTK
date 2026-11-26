@@ -1,7 +1,7 @@
 import { type Client, loginWithQR, type TalkMessage } from "@evex/linejs";
 import { FileStorage } from "@evex/linejs/storage";
 import { join } from "@std/path";
-import { restoreSession } from "./auth.ts";
+import { loginInit, restoreSessionWithFallback } from "./auth.ts";
 import { authenticateEmail } from "./email_login.ts";
 import type { CachePolicy } from "./cache_policy.ts";
 import { contactKind, friendName, picturePathOf } from "./contacts.ts";
@@ -332,7 +332,7 @@ export function createCommandService(runtime: CommandRuntime) {
         onReceiveQRUrl: (url) => emitEvent("qr", { url }),
         onPincodeRequest: (pin) => emitEvent("pin", { pin }),
       },
-      { device, version: LINE_VERSION, storage },
+      { ...loginInit(device, LINE_VERSION), storage },
     );
     runtime.setClient(client);
     await saveAuth(client.authToken, device);
@@ -363,8 +363,15 @@ export function createCommandService(runtime: CommandRuntime) {
       fail(id, "no_auth_token");
       return;
     }
-    const device = await loadAuthDevice();
-    client = await restoreSession(auth, device, storagePath, LINE_VERSION);
+    const initialDevice = await loadAuthDevice();
+    const restored = await restoreSessionWithFallback(
+      auth,
+      initialDevice,
+      storagePath,
+      LINE_VERSION,
+    );
+    client = restored.client;
+    const device = restored.device;
     runtime.setClient(client);
     await saveAuth(client.authToken, device);
     const profile = await client.getMyProfile();
