@@ -117,6 +117,8 @@ pub(super) fn answer_voice_call(state: &AppState) {
     ) {
         Ok(_) => {
             *state.incoming_call_from.borrow_mut() = None;
+            *state.incoming_call_id.borrow_mut() = None;
+            dismiss_call_notification(state);
             *state.active_call_peer.borrow_mut() = Some(from.clone());
             let name = peer_display_name(state, &from);
             ensure_call_window(
@@ -132,6 +134,7 @@ pub(super) fn answer_voice_call(state: &AppState) {
 pub(super) fn decline_voice_call(state: &AppState) {
     let _ = state.sidecar.call_decline();
     *state.incoming_call_from.borrow_mut() = None;
+    *state.incoming_call_id.borrow_mut() = None;
     close_active_call_ui(state);
     toast(state, &crate::i18n::t("call_declined"));
 }
@@ -139,6 +142,7 @@ pub(super) fn decline_voice_call(state: &AppState) {
 pub(super) fn end_voice_call(state: &AppState) {
     let _ = state.sidecar.call_end();
     *state.incoming_call_from.borrow_mut() = None;
+    *state.incoming_call_id.borrow_mut() = None;
     close_active_call_ui(state);
 }
 
@@ -233,6 +237,12 @@ pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMo
     }
 
     if let Some(ui) = state.call_ui.borrow().as_ref() {
+        let initial = peer_name
+            .chars()
+            .next()
+            .map(|c| c.to_uppercase().to_string())
+            .unwrap_or_else(|| "?".into());
+        ui.avatar_label.set_text(&initial);
         ui.peer_label.set_text(peer_name);
         match mode {
             CallMode::Outgoing(status) => call_window::set_outgoing_mode(ui, status),
@@ -244,6 +254,7 @@ pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMo
 }
 
 pub(super) fn close_active_call_ui(state: &AppState) {
+    dismiss_call_notification(state);
     *state.active_call_peer.borrow_mut() = None;
     *state.call_mic_muted.borrow_mut() = false;
     *state.call_deafened.borrow_mut() = false;
@@ -304,12 +315,35 @@ pub(super) fn handle_call_state(
     }
 }
 
-pub(super) fn notify_call_incoming(state: &AppState, name: &str) {
+pub(super) fn dismiss_call_notification(state: &AppState) {
+    if let Some(handle) = state.call_notif.borrow_mut().take() {
+        handle.close();
+    }
+    state.app.withdraw_notification("line-gtk-call");
+}
+
+pub(super) fn notify_call_incoming(state: &AppState, peer_mid: &str, name: &str) {
+    dismiss_call_notification(state);
     if !notifications_allowed(state) {
         return;
     }
-    let n = gio::Notification::new(&crate::i18n::t("voice_call"));
-    n.set_body(Some(&crate::i18n::tf("call_incoming", &[("name", name)])));
-    n.set_priority(gio::NotificationPriority::Urgent);
-    state.app.send_notification(Some("line-gtk-call"), &n);
+    let title = crate::i18n::t("voice_call");
+    let body = crate::i18n::tf("call_incoming", &[("name", name)]);
+    let avatar_path = state
+        .chats
+        .borrow()
+        .iter()
+        .find(|c| c.mid == peer_mid)
+        .and_then(|c| c.avatar_path.clone());
+    match crate::desktop_notify::show_call_notification(&title, &body, avatar_path.as_deref()) {
+        Ok(handle) => {
+            *state.call_notif.borrow_mut() = Some(handle);
+        }
+        Err(_) => {
+            let n = gio::Notification::new(&title);
+            n.set_body(Some(&body));
+            n.set_priority(gio::NotificationPriority::Urgent);
+            state.app.send_notification(Some("line-gtk-call"), &n);
+        }
+    }
 }

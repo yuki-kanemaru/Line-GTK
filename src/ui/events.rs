@@ -169,12 +169,13 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             }
             let name = peer_display_name(state, &from);
             *state.incoming_call_from.borrow_mut() = Some(from.clone());
+            *state.incoming_call_id.borrow_mut() = (!call_id.is_empty()).then(|| call_id.clone());
             ensure_call_window(
                 state,
                 &name,
                 CallMode::Incoming(&crate::i18n::tf("call_incoming", &[("name", &name)])),
             );
-            notify_call_incoming(state, &name);
+            notify_call_incoming(state, &from, &name);
         }
         ProtocolEvent::CallCanceled {
             call_id,
@@ -182,15 +183,32 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             reason,
         } => {
             tracing::info!(%call_id, %from, %reason, "call canceled");
-            let name = peer_display_name(state, &from);
-            toast(state, &crate::i18n::tf("call_canceled", &[("name", &name)]));
-            let was_incoming = state.incoming_call_from.borrow().as_deref() == Some(from.as_str());
-            let was_active = state.active_call_peer.borrow().as_deref() == Some(from.as_str());
+            let was_incoming = (!from.is_empty()
+                && state.incoming_call_from.borrow().as_deref() == Some(from.as_str()))
+                || (!call_id.is_empty()
+                    && state.incoming_call_id.borrow().as_deref() == Some(call_id.as_str()))
+                || (from.is_empty()
+                    && call_id.is_empty()
+                    && state.incoming_call_from.borrow().is_some());
+            let was_active = !from.is_empty()
+                && state.active_call_peer.borrow().as_deref() == Some(from.as_str());
             if was_incoming {
                 *state.incoming_call_from.borrow_mut() = None;
+                *state.incoming_call_id.borrow_mut() = None;
+                dismiss_call_notification(state);
             }
             if was_incoming || was_active {
                 close_active_call_ui(state);
+            }
+            // 他端末での応答・終了やタイムアウト時は静かに着信画面と通知だけを閉じる。
+            let silent = matches!(
+                reason.as_str(),
+                "handled_elsewhere" | "answered_elsewhere" | "timeout"
+            );
+            if !silent && (was_incoming || was_active) {
+                let peer = if from.is_empty() { &call_id } else { &from };
+                let name = peer_display_name(state, peer);
+                toast(state, &crate::i18n::tf("call_canceled", &[("name", &name)]));
             }
         }
         ProtocolEvent::CallState {

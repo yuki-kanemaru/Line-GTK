@@ -1,13 +1,39 @@
 import type { Client } from "@evex/linejs";
+import type {
+  IncomingAudioCall,
+  PlanetEndReason,
+  PlanetIncomingIdentity,
+} from "@evex/linejs/call";
+import { join } from "@std/path";
 import type { LineDevice } from "./auth.ts";
+import { readPrivateTextFile, writePrivateTextFile } from "./storage.ts";
 
 type Json = Record<string, unknown>;
+
+export type IncomingWatchHandle = {
+  ended: Promise<PlanetEndReason>;
+  accept: () => Promise<{ mediaReady?: boolean }>;
+  transport: NonNullable<ActiveCall["transport"]>;
+  /** ユーザーが明示的に拒否したときだけ REL_REQ を送って閉じる。 */
+  decline: () => Promise<void>;
+  /** リモート解放済みソケットの後始末（remoteReleased なので REL_REQ を送らない）。 */
+  closeAfterRemote: () => Promise<void>;
+};
+
+export type IncomingWatcher = (
+  audio: IncomingAudioCall,
+  signal: AbortSignal,
+) => Promise<IncomingWatchHandle>;
+
 type CallRuntime = {
   getClient: () => Client | null;
   loadAuthDevice: () => Promise<LineDevice>;
   emitEvent: (event: string, payload?: Json) => void;
   ok: (id: number | string | null, result?: unknown) => void;
   fail: (id: number | string | null, error: string) => void;
+  dataDir?: string;
+  watchIncomingAudio?: IncomingWatcher;
+  incomingTimeoutMs?: number;
 };
 
 let runtime: CallRuntime;
@@ -74,8 +100,23 @@ type ActiveCall = {
   aborted: boolean;
 };
 
+type IncomingOffer = {
+  callId: string;
+  token: string;
+  from: string;
+  kind: string;
+  audio?: IncomingAudioCall;
+  generation: number;
+  timer?: ReturnType<typeof setTimeout>;
+  verifyAbort?: AbortController;
+  watch?: IncomingWatchHandle;
+  verified: boolean;
+};
+
+const DEFAULT_INCOMING_TIMEOUT_MS = 65_000;
 let activeCall: ActiveCall | null = null;
-let incomingOffer: { callId: string; from: string; kind: string } | null = null;
+let incomingOffer: IncomingOffer | null = null;
+let incomingGeneration = 0;
 let callAudioInput = readEnv("LINE_GTK_AUDIO_INPUT")?.trim() || "default";
 let callAudioOutput = readEnv("LINE_GTK_AUDIO_OUTPUT")?.trim() || "default";
 
@@ -497,6 +538,162 @@ async function cancelRouteRing(
   }
 }
 
+function clearOfferTimer(offer: IncomingOffer | null) {
+  if (offer?.timer !== undefined) {
+    clearTimeout(offer.timer);
+    offer.timer = undefined;
+  }
+}
+
+function abortUnverifiedWatch(offer: IncomingOffer | null) {
+  // VERIFY 完了前のみ abort する（完了後に abort すると REL_REQ が送られ他端末通話に影響し得る）。
+  if (offer && !offer.verified) {
+    offer.verifyAbort?.abort();
+  }
+  if (offer) offer.verifyAbort = undefined;
+}
+
+async function loadOrCreateCallDeviceId(): Promise<string> {
+  const path = runtime.dataDir
+    ? join(runtime.dataDir, "call-device-id.txt")
+    : null;
+  if (path) {
+    try {
+      const existing = (await readPrivateTextFile(path)).trim();
+      if (/^[A-Za-z0-9+/]{43}=$/.test(existing)) return existing;
+    } catch { /* generate new */ }
+  }
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  const deviceId = btoa(binary);
+  if (path) {
+    try {
+      await writePrivateTextFile(path, deviceId);
+    } catch (e) {
+      callLog("failed to persist call-device-id", {
+        err: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+  return deviceId;
+}
+
+async function defaultWatchIncomingAudio(
+  audio: IncomingAudioCall,
+  signal: AbortSignal,
+): Promise<IncomingWatchHandle> {
+  const client = runtime.getClient();
+  if (!client) throw new Error("not_logged_in");
+  const localMid = client.base.profile?.mid ?? "";
+  if (!localMid) throw new Error("profile_not_ready");
+  const { PlanetTransport, defaultCallFromEnvInfo } = await import(
+    "@evex/linejs/call"
+  );
+  const details = client.base.deviceDetails;
+  const deviceId = await loadOrCreateCallDeviceId();
+  const identity: PlanetIncomingIdentity = {
+    deviceId,
+    userAgent: {
+      osName: details.systemName,
+      osVersion: details.systemVersion,
+      deviceName: defaultCallFromEnvInfo(details).devname,
+      appReleaseInfo: [
+        details.device,
+        details.appVersion,
+        details.systemName,
+        details.systemVersion,
+      ].join("\t"),
+    },
+  };
+  const transport = new PlanetTransport({
+    localMid,
+    timeoutMs: 10_000,
+    keepaliveIntervalMs: 10_000,
+  });
+  try {
+    await transport.connect({ route: audio.route });
+    signal.throwIfAborted();
+    await transport.verifyIncomingDetailed(audio, identity, signal);
+  } catch (error) {
+    await transport.close().catch(() => {});
+    throw error;
+  }
+  return {
+    ended: transport.ended,
+    accept: () => transport.acceptIncomingDetailed(),
+    transport: transport as unknown as NonNullable<ActiveCall["transport"]>,
+    decline: () => transport.close(),
+    closeAfterRemote: () => transport.close(),
+  };
+}
+
+function dismissIncomingOffer(offer: IncomingOffer, reason: string) {
+  if (incomingOffer !== offer) return;
+  incomingOffer = null;
+  clearOfferTimer(offer);
+  abortUnverifiedWatch(offer);
+  emitEvent("call_canceled", {
+    callId: offer.callId,
+    from: offer.from,
+    reason,
+  });
+}
+
+function startIncomingAudioWatch(
+  offer: IncomingOffer,
+  audio: IncomingAudioCall,
+) {
+  const watcher = runtime.watchIncomingAudio ?? defaultWatchIncomingAudio;
+  const controller = new AbortController();
+  offer.verifyAbort = controller;
+  void (async () => {
+    try {
+      const handle = await watcher(audio, controller.signal);
+      if (incomingOffer !== offer) {
+        // 既に別イベントで終了済み。リモート解放後にのみ安全に閉じる。
+        void handle.ended
+          .then(() => handle.closeAfterRemote())
+          .catch(() => {});
+        return;
+      }
+      offer.verified = true;
+      offer.verifyAbort = undefined;
+      offer.watch = handle;
+      callLog("incoming audio verified (watching remote release)", {
+        callId: offer.callId,
+        from: offer.from,
+      });
+      const reason = await handle.ended;
+      if (reason.by === "remote") {
+        callLog("incoming call released remotely", {
+          callId: offer.callId,
+          from: offer.from,
+          relCode: reason.relCode,
+          releaser: reason.releaser,
+        });
+        await handle.closeAfterRemote().catch(() => {});
+        dismissIncomingOffer(offer, "handled_elsewhere");
+      }
+    } catch (error) {
+      if (controller.signal.aborted) return;
+      const message = error instanceof Error ? error.message : String(error);
+      callLog("incoming audio watch ended", {
+        callId: offer.callId,
+        from: offer.from,
+        err: message,
+      });
+      if (
+        incomingOffer === offer &&
+        /VERIFY rejected|already handled/i.test(message)
+      ) {
+        dismissIncomingOffer(offer, "handled_elsewhere");
+      }
+    }
+  })();
+}
+
 export async function doCallAnswer(id: number | string | null) {
   const client = runtime.getClient();
   if (!client) {
@@ -513,9 +710,65 @@ export async function doCallAnswer(id: number | string | null) {
     return;
   }
   incomingOffer = null;
-  // linejs 3.2.1 has no callee SETUP handler for 1:1 PLANET yet.
-  // Answering starts a fresh outgoing audio session to the caller so media
-  // can negotiate; hangup still sends REL_REQ to stop their ring.
+  clearOfferTimer(offer);
+  abortUnverifiedWatch(offer);
+
+  // VERIFY 済みの着信セッションがあればそのまま PLANET で応答する。
+  if (offer.watch && client.base.profile?.mid) {
+    const watch = offer.watch;
+    const call: ActiveCall = {
+      id: offer.callId || `in-${Date.now()}`,
+      peer: offer.from,
+      direction: "in",
+      localMid: client.base.profile.mid,
+      transport: watch.transport,
+      aborted: false,
+    };
+    activeCall = call;
+    ok(id, { answering: true, peer: offer.from, callId: call.id });
+    emitEvent("call_state", {
+      callId: call.id,
+      peer: offer.from,
+      state: "connecting",
+    });
+    try {
+      const answer = await watch.accept();
+      if (call.aborted || activeCall !== call) {
+        await watch.decline().catch(() => {});
+        return;
+      }
+      if (!answer.mediaReady) {
+        throw new Error("incoming answer without media");
+      }
+      const { opusCodecFactory } = await import(
+        "../vendor/linejs-call/entry.ts"
+      );
+      emitEvent("call_state", {
+        callId: call.id,
+        peer: offer.from,
+        state: "connected",
+      });
+      call.stopAudio = await startCallAudioIO(
+        watch.transport,
+        opusCodecFactory as unknown as Parameters<typeof startCallAudioIO>[1],
+      );
+      void watch.ended
+        .then((reason) => {
+          if (reason.by === "remote" && activeCall === call) {
+            void endActiveCall();
+          }
+        })
+        .catch(() => {});
+      return;
+    } catch (error) {
+      callLog("native incoming answer failed, falling back to outgoing", {
+        err: error instanceof Error ? error.message : String(error),
+      });
+      if (activeCall === call) activeCall = null;
+      await watch.decline().catch(() => {});
+    }
+  }
+
   ok(id, { answering: true, peer: offer.from, callId: offer.callId });
   await doCallStart(null, offer.from);
 }
@@ -524,7 +777,18 @@ export async function doCallDecline(id: number | string | null) {
   const client = runtime.getClient();
   const offer = incomingOffer;
   incomingOffer = null;
-  if (offer && client?.base.profile?.mid) {
+  clearOfferTimer(offer);
+  abortUnverifiedWatch(offer);
+  if (offer?.watch) {
+    await offer.watch.decline().catch((e) => {
+      console.error("[call decline watch]", e);
+    });
+    emitEvent("call_state", {
+      callId: offer.callId,
+      peer: offer.from,
+      state: "ended",
+    });
+  } else if (offer && client?.base.profile?.mid) {
     // Try to tear down any server-side ring by acquiring+REL quickly.
     try {
       const route = await client.call.acquireRoute({
@@ -910,13 +1174,23 @@ async function endActiveCall(opts: { silent?: boolean } = {}) {
 }
 
 export async function doCallEnd(id: number | string | null) {
+  const offer = incomingOffer;
   incomingOffer = null;
+  clearOfferTimer(offer);
+  abortUnverifiedWatch(offer);
   await endActiveCall();
   ok(id, { ended: true });
 }
 
+export function resetIncomingCall() {
+  const offer = incomingOffer;
+  incomingOffer = null;
+  clearOfferTimer(offer);
+  abortUnverifiedWatch(offer);
+}
+
 export type IncomingCallInput = {
-  audio?: { callId?: unknown; callerMid?: unknown };
+  audio?: IncomingAudioCall | { callId?: unknown; callerMid?: unknown };
   callMid?: unknown;
   from?: unknown;
   kind?: unknown;
@@ -1058,26 +1332,100 @@ export function normalizeCancelCall(ev: CancelCallInput): {
   };
 }
 
+function isFullIncomingAudio(
+  audio: IncomingCallInput["audio"],
+): audio is IncomingAudioCall {
+  if (!audio || typeof audio !== "object") return false;
+  const candidate = audio as Partial<IncomingAudioCall>;
+  return typeof candidate.callId === "string" &&
+    typeof candidate.callerMid === "string" &&
+    typeof candidate.localMid === "string" &&
+    candidate.credential instanceof Uint8Array &&
+    !!candidate.route && typeof candidate.route === "object";
+}
+
+function extractIncomingToken(ev: IncomingCallInput): string {
+  const meta = parseCallJson(ev.raw?.param3) ?? parseCallJson(ev.kind);
+  if (typeof meta?.n === "string" && meta.n.trim()) return meta.n.trim();
+  if (typeof ev.raw?.param2 === "string" && ev.raw.param2.trim()) {
+    return ev.raw.param2.trim();
+  }
+  const fromText = typeof ev.from === "string" ? ev.from.trim() : "";
+  if (fromText && !LINE_MID_RE.test(fromText)) return fromText;
+  return "";
+}
+
+function matchesIncomingOffer(
+  offer: IncomingOffer,
+  from: string,
+  callId: string,
+): boolean {
+  if (from && offer.from === from) return true;
+  if (callId && (offer.callId === callId || offer.token === callId)) {
+    return true;
+  }
+  return !from && !callId;
+}
+
 export function handleIncomingCall(ev: IncomingCallInput) {
   const { callId, from, kind } = normalizeIncomingCall(ev);
-  incomingOffer = { callId, from, kind };
+  const prev = incomingOffer;
+  clearOfferTimer(prev);
+  abortUnverifiedWatch(prev);
+
+  const audio = isFullIncomingAudio(ev.audio) ? ev.audio : undefined;
+  const offer: IncomingOffer = {
+    callId,
+    token: extractIncomingToken(ev),
+    from,
+    kind,
+    audio,
+    generation: ++incomingGeneration,
+    verified: false,
+  };
+  const timeoutMs = runtime.incomingTimeoutMs ?? DEFAULT_INCOMING_TIMEOUT_MS;
+  if (timeoutMs > 0) {
+    offer.timer = setTimeout(() => {
+      dismissIncomingOffer(offer, "timeout");
+    }, timeoutMs);
+  }
+  incomingOffer = offer;
   emitEvent("call_incoming", { callId, from, kind });
+
+  if (audio) {
+    startIncomingAudioWatch(offer, audio);
+  }
+}
+
+export function handleCallMessage(chatMid: string) {
+  const offer = incomingOffer;
+  if (!offer || !chatMid || offer.from !== chatMid) return;
+  dismissIncomingOffer(offer, "handled_elsewhere");
 }
 
 export function handleCallCancel(ev: CancelCallInput) {
   const { callId, from, reason } = normalizeCancelCall(ev);
-  if (
-    (from && incomingOffer?.from === from) ||
-    (callId && incomingOffer?.callId === callId)
-  ) {
+  const offer = incomingOffer;
+  const matchedOffer = offer && matchesIncomingOffer(offer, from, callId)
+    ? offer
+    : null;
+  const matchedActive = activeCall &&
+    ((from && activeCall.peer === from) ||
+      (callId && activeCall.id === callId) || !from);
+
+  if (matchedOffer) {
     incomingOffer = null;
+    clearOfferTimer(matchedOffer);
+    abortUnverifiedWatch(matchedOffer);
   }
-  emitEvent("call_canceled", {
-    callId,
-    from,
-    reason,
-  });
-  if (activeCall && (activeCall.peer === from || !from)) {
+  if (matchedOffer || matchedActive) {
+    emitEvent("call_canceled", {
+      callId: callId || matchedOffer?.callId || "",
+      from: from || matchedOffer?.from || "",
+      reason,
+    });
+  }
+  if (matchedActive) {
     void endActiveCall();
   }
 }

@@ -158,6 +158,8 @@ pub(super) struct AppState {
     pub session_ready: Rc<RefCell<bool>>,
     pub active_call_peer: Rc<RefCell<Option<String>>>,
     pub incoming_call_from: Rc<RefCell<Option<String>>>,
+    pub incoming_call_id: Rc<RefCell<Option<String>>>,
+    pub call_notif: Rc<RefCell<Option<crate::desktop_notify::CallNotificationHandle>>>,
     pub call_ui: Rc<RefCell<Option<call_window::CallUi>>>,
     pub call_mic_muted: Rc<RefCell<bool>>,
     pub call_deafened: Rc<RefCell<bool>>,

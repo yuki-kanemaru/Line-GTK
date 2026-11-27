@@ -9,6 +9,7 @@ export type ListenerRuntime = {
   prepareMessage?: (message: Json) => Promise<Json | null>;
   handleIncomingCall: typeof calls.handleIncomingCall;
   handleCallCancel: typeof calls.handleCallCancel;
+  handleCallMessage?: (chatMid: string) => void;
   shouldIgnoreMessage?: (message: Json) => boolean;
   getClient: () => Client | null;
   observeMessage?: (message: Json) => void;
@@ -72,6 +73,9 @@ export function createListener(runtime: ListenerRuntime) {
         ) return;
         if (runtime.shouldIgnoreMessage?.(message)) return;
         const peer = conversationMid(message);
+        if (String(message.contentType ?? "").toUpperCase() === "CALL") {
+          runtime.handleCallMessage?.(peer);
+        }
         if (message.id) {
           const key = `${account}:${peer}:${message.id}`;
           if (delivered.has(key)) return;
@@ -116,6 +120,15 @@ export function createListener(runtime: ListenerRuntime) {
       try {
         if (runtime.getClient() !== client) return;
         const type = String(op?.type ?? "");
+        if (type === "CANCEL_CALL" || type === "51") {
+          runtime.handleCallCancel({
+            callMid: op.param1,
+            from: op.param2,
+            reason: op.param3,
+            raw: op,
+          });
+          return;
+        }
         if (runtime.handleReadReceipt(op)) {
           return;
         } else if (

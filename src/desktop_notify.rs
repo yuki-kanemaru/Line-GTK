@@ -1,13 +1,48 @@
 //! デスクトップ通知。スタンプの画像表示と、同じ通知の更新を扱う。
 
 use crate::tray::TrayAction;
-use notify_rust::{Hint, Notification, Timeout};
+use notify_rust::{Hint, Notification, NotificationHandle, Timeout, Urgency};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+
+pub struct CallNotificationHandle {
+    handle: NotificationHandle,
+}
+
+impl CallNotificationHandle {
+    pub fn close(self) {
+        self.handle.close();
+    }
+}
+
+pub fn show_call_notification(
+    title: &str,
+    body: &str,
+    avatar_path: Option<&str>,
+) -> Result<CallNotificationHandle, String> {
+    let mut n = Notification::new();
+    n.summary(title)
+        .body(body)
+        .appname("LINE GTK")
+        .urgency(Urgency::Critical)
+        .timeout(Timeout::Milliseconds(65_000))
+        .hint(Hint::DesktopEntry("dev.linegtk.LineGtk".into()))
+        .hint(Hint::Category("call.incoming".into()))
+        .hint(Hint::Transient(true));
+
+    if let Some(path) = avatar_path.filter(|p| !p.is_empty() && Path::new(p).exists()) {
+        n.icon(path);
+    } else {
+        n.icon("line-gtk");
+    }
+
+    let handle = n.show().map_err(|e| e.to_string())?;
+    Ok(CallNotificationHandle { handle })
+}
 
 #[derive(Debug, Clone)]
 pub struct NotificationTicket {

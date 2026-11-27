@@ -8,6 +8,7 @@ use std::time::Instant;
 
 pub struct CallUi {
     pub window: ApplicationWindow,
+    pub avatar_label: gtk::Label,
     pub peer_label: gtk::Label,
     pub status_label: gtk::Label,
     pub timer_label: gtk::Label,
@@ -215,6 +216,7 @@ pub fn open_call_window(
 
     CallUi {
         window,
+        avatar_label: avatar,
         peer_label,
         status_label,
         timer_label,

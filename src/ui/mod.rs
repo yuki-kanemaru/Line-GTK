@@ -289,6 +289,8 @@ fn build_ui(app: &Application, repo_root: PathBuf, data_dir: PathBuf) -> Result<
         session_device: Rc::new(RefCell::new(String::new())),
         active_call_peer: Rc::new(RefCell::new(None)),
         incoming_call_from: Rc::new(RefCell::new(None)),
+        incoming_call_id: Rc::new(RefCell::new(None)),
+        call_notif: Rc::new(RefCell::new(None)),
         call_ui: Rc::new(RefCell::new(None)),
         call_mic_muted: Rc::new(RefCell::new(false)),
         call_deafened: Rc::new(RefCell::new(false)),
@@ -1560,6 +1562,7 @@ fn wire_actions(state: &AppState) {
                     close_active_call_ui(&s2);
                     *s2.active_call_peer.borrow_mut() = None;
                     *s2.incoming_call_from.borrow_mut() = None;
+                    *s2.incoming_call_id.borrow_mut() = None;
                     login::set_method(&s2.login, login::LoginMethod::Qr);
                     s2.session_device.borrow_mut().clear();
                     login::show_qr_stage(&s2.login);

@@ -204,6 +204,7 @@ calls.configureCallRuntime({
   emitEvent,
   ok,
   fail,
+  dataDir,
 });
 
 const mediaCache = createMediaCache({
@@ -527,6 +528,7 @@ const listener = createListener({
   },
   handleIncomingCall: calls.handleIncomingCall,
   handleCallCancel: calls.handleCallCancel,
+  handleCallMessage: calls.handleCallMessage,
   shouldIgnoreMessage: contactBlocks.ignoreMessage,
   getClient: () => client,
   observeMessage: (message) => {
@@ -681,6 +683,7 @@ function bumpMediaEpoch(chatMid: string): number {
 let workGen = 0;
 function cancelBackgroundWork() {
   workGen++;
+  calls.resetIncomingCall();
   for (const mid of [...mediaEpoch.keys()]) {
     bumpMediaEpoch(mid);
   }
