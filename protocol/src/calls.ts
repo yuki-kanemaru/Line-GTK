@@ -32,13 +32,19 @@ async function loadAuthDevice() {
   return await runtime.loadAuthDevice();
 }
 
-const LINE_CALL_DEVNAME = Deno.env.get("LINE_CALL_DEVNAME")?.trim() || "";
-const LINE_CALL_DEVICE_INFO = Deno.env.get("LINE_CALL_DEVICE_INFO")?.trim() ||
-  `ANDROID\t${
-    Deno.env.get("LINE_VERSION")?.trim() || "26.6.2"
-  }\tAndroid OS\t16`;
+function readEnv(name: string): string | undefined {
+  try {
+    return Deno.env.get(name);
+  } catch {
+    return undefined;
+  }
+}
+
+const LINE_CALL_DEVNAME = readEnv("LINE_CALL_DEVNAME")?.trim() || "";
+const LINE_CALL_DEVICE_INFO = readEnv("LINE_CALL_DEVICE_INFO")?.trim() ||
+  `ANDROID\t${readEnv("LINE_VERSION")?.trim() || "26.6.2"}\tAndroid OS\t16`;
 const LINE_CALL_OPUS_SIGNAL = (() => {
-  const value = Deno.env.get("LINE_CALL_OPUS_SIGNAL")?.trim() || "music";
+  const value = readEnv("LINE_CALL_OPUS_SIGNAL")?.trim() || "music";
   return value === "auto" || value === "voice" || value === "music"
     ? value
     : "music";
@@ -70,9 +76,8 @@ type ActiveCall = {
 
 let activeCall: ActiveCall | null = null;
 let incomingOffer: { callId: string; from: string; kind: string } | null = null;
-let callAudioInput = Deno.env.get("LINE_GTK_AUDIO_INPUT")?.trim() || "default";
-let callAudioOutput = Deno.env.get("LINE_GTK_AUDIO_OUTPUT")?.trim() ||
-  "default";
+let callAudioInput = readEnv("LINE_GTK_AUDIO_INPUT")?.trim() || "default";
+let callAudioOutput = readEnv("LINE_GTK_AUDIO_OUTPUT")?.trim() || "default";
 
 export function setCallAudioDevices(input?: string, output?: string) {
   if (input && input.trim()) callAudioInput = input.trim();
@@ -128,7 +133,7 @@ let lastDecryptFailLog = 0;
 let decryptFailCount = 0;
 
 /** Call tracing — set LINE_CALL_DEBUG=0 to quiet noisy packet spam. */
-const CALL_DEBUG_VERBOSE = Deno.env.get("LINE_CALL_DEBUG")?.trim() !== "0";
+const CALL_DEBUG_VERBOSE = readEnv("LINE_CALL_DEBUG")?.trim() !== "0";
 
 function callLog(stage: string, detail?: Record<string, unknown>) {
   if (detail) console.error(`[call] ${stage}`, detail);
@@ -910,34 +915,167 @@ export async function doCallEnd(id: number | string | null) {
   ok(id, { ended: true });
 }
 
-export function handleIncomingCall(ev: {
-  callMid?: string;
-  from?: string;
-  kind?: string;
-}) {
-  const callId = String(ev.callMid ?? "");
-  const from = String(ev.from ?? "");
-  const kind = String(ev.kind ?? "AUDIO");
+export type IncomingCallInput = {
+  audio?: { callId?: unknown; callerMid?: unknown };
+  callMid?: unknown;
+  from?: unknown;
+  kind?: unknown;
+  raw?: { param1?: unknown; param2?: unknown; param3?: unknown };
+};
+
+export type CancelCallInput = {
+  callMid?: unknown;
+  from?: unknown;
+  reason?: unknown;
+  raw?: { param1?: unknown; param2?: unknown; param3?: unknown };
+};
+
+const LINE_MID_RE = /^[ucr][0-9a-f]{32}$/;
+const SAFE_CALL_KIND_RE = /^[A-Za-z0-9_-]{1,32}$/;
+
+function isLineMid(value: unknown): value is string {
+  return typeof value === "string" && LINE_MID_RE.test(value);
+}
+
+function parseCallJson(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") || trimmed.length > 32768) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      ? parsed as Record<string, unknown>
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function resolveCallKind(
+  rawKind: unknown,
+  meta: Record<string, unknown> | null,
+): string {
+  if (meta) {
+    const code = String(meta.k ?? meta.d ?? "").trim().toUpperCase();
+    if (code === "CV" || code === "VIDEO") return "VIDEO";
+    if (code === "CA" || code === "AUDIO") return "AUDIO";
+    if (typeof meta.g === "string" && meta.g.trim()) return "GROUP";
+    return "CALL";
+  }
+  const text = String(rawKind ?? "").trim();
+  if (!text) return "AUDIO";
+  if (SAFE_CALL_KIND_RE.test(text)) return text.toUpperCase();
+  return "CALL";
+}
+
+function sanitizeCallReason(rawReason: unknown): string {
+  const text = String(rawReason ?? "").trim();
+  if (!text) return "";
+  if (text.startsWith("{") || text.length > 128) return "";
+  return text;
+}
+
+// linejs の parseIncomingCall は音声通話(CA)以外で param1(相手MID)と param2(トークン)を
+// 取り違え、param3 の生 JSON を kind へ渡すためここで正規化する。
+export function normalizeIncomingCall(ev: IncomingCallInput): {
+  callId: string;
+  from: string;
+  kind: string;
+} {
+  const raw = ev.raw;
+  const meta = parseCallJson(raw?.param3) ?? parseCallJson(ev.kind);
+
+  let from = "";
+  if (isLineMid(ev.audio?.callerMid)) {
+    from = ev.audio.callerMid;
+  } else if (isLineMid(ev.from)) {
+    from = ev.from;
+  } else if (isLineMid(raw?.param1)) {
+    from = raw.param1;
+  } else if (isLineMid(ev.callMid)) {
+    from = ev.callMid;
+  } else if (isLineMid(meta?.g)) {
+    from = meta.g;
+  } else {
+    from = String(ev.from ?? "");
+  }
+
+  let callId = "";
+  if (typeof ev.audio?.callId === "string" && ev.audio.callId.trim()) {
+    callId = ev.audio.callId.trim();
+  } else if (typeof meta?.vs === "string" && meta.vs.trim()) {
+    callId = meta.vs.trim();
+  } else if (typeof meta?.n === "string" && meta.n.trim()) {
+    callId = meta.n.trim();
+  } else if (typeof raw?.param2 === "string" && raw.param2.trim()) {
+    callId = raw.param2.trim();
+  } else if (typeof ev.callMid === "string" && ev.callMid !== from) {
+    callId = ev.callMid;
+  } else if (typeof ev.from === "string" && ev.from !== from) {
+    callId = ev.from;
+  }
+
+  const kind = ev.audio ? "AUDIO" : resolveCallKind(ev.kind, meta);
+  return { callId, from, kind };
+}
+
+export function normalizeCancelCall(ev: CancelCallInput): {
+  callId: string;
+  from: string;
+  reason: string;
+} {
+  const raw = ev.raw;
+  const meta = parseCallJson(raw?.param3) ?? parseCallJson(ev.reason);
+
+  let from = "";
+  if (isLineMid(ev.from)) {
+    from = ev.from;
+  } else if (isLineMid(raw?.param1)) {
+    from = raw.param1;
+  } else if (isLineMid(ev.callMid)) {
+    from = ev.callMid;
+  } else if (isLineMid(meta?.g)) {
+    from = meta.g;
+  } else {
+    from = String(ev.from ?? "");
+  }
+
+  let callId = "";
+  if (typeof meta?.vs === "string" && meta.vs.trim()) {
+    callId = meta.vs.trim();
+  } else if (typeof ev.callMid === "string" && ev.callMid !== from) {
+    callId = ev.callMid;
+  } else if (typeof raw?.param2 === "string" && raw.param2.trim()) {
+    callId = raw.param2.trim();
+  } else if (typeof ev.from === "string" && ev.from !== from) {
+    callId = ev.from;
+  }
+
+  return {
+    callId,
+    from,
+    reason: sanitizeCallReason(ev.reason),
+  };
+}
+
+export function handleIncomingCall(ev: IncomingCallInput) {
+  const { callId, from, kind } = normalizeIncomingCall(ev);
   incomingOffer = { callId, from, kind };
   emitEvent("call_incoming", { callId, from, kind });
 }
 
-export function handleCallCancel(ev: {
-  callMid?: string;
-  from?: string;
-  reason?: string;
-}) {
-  const from = String(ev.from ?? "");
+export function handleCallCancel(ev: CancelCallInput) {
+  const { callId, from, reason } = normalizeCancelCall(ev);
   if (
-    incomingOffer?.from === from ||
-    incomingOffer?.callId === String(ev.callMid ?? "")
+    (from && incomingOffer?.from === from) ||
+    (callId && incomingOffer?.callId === callId)
   ) {
     incomingOffer = null;
   }
   emitEvent("call_canceled", {
-    callId: String(ev.callMid ?? ""),
+    callId,
     from,
-    reason: String(ev.reason ?? ""),
+    reason,
   });
   if (activeCall && (activeCall.peer === from || !from)) {
     void endActiveCall();
