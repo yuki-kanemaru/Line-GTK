@@ -2505,18 +2505,29 @@ if (bootAuth) {
 
 const decoder = new TextDecoder();
 let buf = "";
-for await (const chunk of Deno.stdin.readable) {
-  buf += decoder.decode(chunk, { stream: true });
-  while (true) {
-    const nl = buf.indexOf("\n");
-    if (nl < 0) break;
-    const line = buf.slice(0, nl).trim();
-    buf = buf.slice(nl + 1);
-    if (!line) continue;
-    try {
-      handle(JSON.parse(line) as Json);
-    } catch (e) {
-      fail(null, `bad_json:${e}`);
+try {
+  for await (const chunk of Deno.stdin.readable) {
+    buf += decoder.decode(chunk, { stream: true });
+    while (true) {
+      const nl = buf.indexOf("\n");
+      if (nl < 0) break;
+      const line = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 1);
+      if (!line) continue;
+      try {
+        handle(JSON.parse(line) as Json);
+      } catch (e) {
+        fail(null, `bad_json:${e}`);
+      }
     }
   }
+} finally {
+  // GUI 側が閉じた際に /PUSH や noop でオンライン状態を残さないよう確実に終了する。
+  stdoutAlive = false;
+  cancelBackgroundWork();
+  if (client) {
+    retireClient(client);
+    client = null;
+  }
+  Deno.exit(0);
 }
