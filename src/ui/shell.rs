@@ -859,12 +859,7 @@ pub fn load_css() {
         }
         .line-call-avatar {
             border-radius: 999px;
-            overflow: hidden;
-            min-width: 96px;
-            min-height: 96px;
-            background: alpha(@accent_bg_color, 0.35);
-            font-size: 2.4em;
-            font-weight: 700;
+            box-shadow: 0 2px 10px alpha(@window_fg_color, 0.16);
         }
         .line-call-ctl {
             min-width: 52px;

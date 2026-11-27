@@ -87,6 +87,7 @@ pub(super) fn start_voice_call(state: &AppState) {
             let name = peer_display_name(state, &mid);
             ensure_call_window(
                 state,
+                &mid,
                 &name,
                 CallMode::Outgoing(&crate::i18n::tf("call_calling", &[("name", &name)])),
             );
@@ -123,6 +124,7 @@ pub(super) fn answer_voice_call(state: &AppState) {
             let name = peer_display_name(state, &from);
             ensure_call_window(
                 state,
+                &from,
                 &name,
                 CallMode::Outgoing(&crate::i18n::tf("call_answering", &[("name", &name)])),
             );
@@ -152,13 +154,62 @@ pub(super) enum CallMode<'a> {
     Connected(&'a str),
 }
 
-pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMode<'_>) {
+pub(super) fn peer_avatar_path(state: &AppState, peer_mid: &str) -> Option<String> {
+    if peer_mid.is_empty() {
+        return None;
+    }
+    if let Some(path) = state
+        .chats
+        .borrow()
+        .iter()
+        .find(|c| c.mid == peer_mid)
+        .and_then(|c| c.avatar_path.as_deref())
+        .filter(|path| !path.is_empty() && std::path::Path::new(path).is_file())
+    {
+        return Some(path.to_string());
+    }
+    let cached = state
+        .data_dir
+        .join("cache")
+        .join("avatars")
+        .join(format!("{peer_mid}.jpg"));
+    cached
+        .is_file()
+        .then(|| cached.to_string_lossy().to_string())
+}
+
+pub(super) fn refresh_call_window_avatar(state: &AppState, mid: &str, avatar_path: &str) {
+    let matches_call = state.incoming_call_from.borrow().as_deref() == Some(mid)
+        || state.active_call_peer.borrow().as_deref() == Some(mid);
+    if !matches_call {
+        return;
+    }
+    if let Some(ui) = state.call_ui.borrow().as_ref() {
+        let name = peer_display_name(state, mid);
+        call_window::set_peer_avatar(ui, &name, Some(avatar_path));
+    }
+}
+
+pub(super) fn ensure_call_window(
+    state: &AppState,
+    peer_mid: &str,
+    peer_name: &str,
+    mode: CallMode<'_>,
+) {
+    let avatar_path = peer_avatar_path(state, peer_mid);
     if state.call_ui.borrow().is_none() {
         let (mic_v, spk_v) = {
             let cfg = state.config.borrow();
             (cfg.call_mic_volume, cfg.call_spk_volume)
         };
-        let ui = call_window::open_call_window(&state.app, &state.window, peer_name, mic_v, spk_v);
+        let ui = call_window::open_call_window(
+            &state.app,
+            &state.window,
+            peer_name,
+            avatar_path.as_deref(),
+            mic_v,
+            spk_v,
+        );
         {
             let s = state.clone();
             ui.hangup_btn.connect_clicked(move |_| end_voice_call(&s));
@@ -237,12 +288,7 @@ pub(super) fn ensure_call_window(state: &AppState, peer_name: &str, mode: CallMo
     }
 
     if let Some(ui) = state.call_ui.borrow().as_ref() {
-        let initial = peer_name
-            .chars()
-            .next()
-            .map(|c| c.to_uppercase().to_string())
-            .unwrap_or_else(|| "?".into());
-        ui.avatar_label.set_text(&initial);
+        call_window::set_peer_avatar(ui, peer_name, avatar_path.as_deref());
         ui.peer_label.set_text(peer_name);
         match mode {
             CallMode::Outgoing(status) => call_window::set_outgoing_mode(ui, status),
@@ -285,6 +331,7 @@ pub(super) fn handle_call_state(
             *state.active_call_peer.borrow_mut() = Some(peer.to_string());
             ensure_call_window(
                 state,
+                peer,
                 &name,
                 CallMode::Outgoing(&crate::i18n::tf("call_calling", &[("name", &name)])),
             );
@@ -293,6 +340,7 @@ pub(super) fn handle_call_state(
             *state.active_call_peer.borrow_mut() = Some(peer.to_string());
             ensure_call_window(
                 state,
+                peer,
                 &name,
                 CallMode::Connected(&crate::i18n::tf("call_connected", &[("name", &name)])),
             );
@@ -329,12 +377,7 @@ pub(super) fn notify_call_incoming(state: &AppState, peer_mid: &str, name: &str)
     }
     let title = crate::i18n::t("voice_call");
     let body = crate::i18n::tf("call_incoming", &[("name", name)]);
-    let avatar_path = state
-        .chats
-        .borrow()
-        .iter()
-        .find(|c| c.mid == peer_mid)
-        .and_then(|c| c.avatar_path.clone());
+    let avatar_path = peer_avatar_path(state, peer_mid);
     match crate::desktop_notify::show_call_notification(&title, &body, avatar_path.as_deref()) {
         Ok(handle) => {
             *state.call_notif.borrow_mut() = Some(handle);

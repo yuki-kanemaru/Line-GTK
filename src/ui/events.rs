@@ -172,6 +172,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
             *state.incoming_call_id.borrow_mut() = (!call_id.is_empty()).then(|| call_id.clone());
             ensure_call_window(
                 state,
+                &from,
                 &name,
                 CallMode::Incoming(&crate::i18n::tf("call_incoming", &[("name", &name)])),
             );
@@ -407,6 +408,7 @@ pub(super) fn handle_event(state: &AppState, ev: ProtocolEvent) {
                     f.avatar_path = Some(avatar_path.clone());
                 }
             }
+            refresh_call_window_avatar(state, &mid, &avatar_path);
             if let Some(chat) = state.chats.borrow_mut().iter_mut().find(|c| c.mid == mid) {
                 chat.avatar_path = Some(avatar_path);
             }

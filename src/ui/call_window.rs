@@ -1,14 +1,16 @@
+use gtk::gdk;
 use gtk::glib;
 use gtk::prelude::*;
 use libadwaita::ApplicationWindow;
 use libadwaita::prelude::*;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
 pub struct CallUi {
     pub window: ApplicationWindow,
-    pub avatar_label: gtk::Label,
+    pub avatar: libadwaita::Avatar,
     pub peer_label: gtk::Label,
     pub status_label: gtk::Label,
     pub timer_label: gtk::Label,
@@ -23,6 +25,8 @@ pub struct CallUi {
     pub in_box: gtk::Box,
     pub connected_at: Rc<RefCell<Option<Instant>>>,
     pub tick: Rc<RefCell<Option<glib::SourceId>>>,
+    avatar_path: Rc<RefCell<Option<String>>>,
+    avatar_gen: Rc<Cell<u64>>,
     hangup_guard: Rc<RefCell<bool>>,
 }
 
@@ -30,12 +34,14 @@ pub fn open_call_window(
     app: &impl IsA<gtk::Application>,
     parent: &ApplicationWindow,
     peer_name: &str,
+    avatar_path: Option<&str>,
     mic_vol: f64,
     spk_vol: f64,
 ) -> CallUi {
     let window = ApplicationWindow::builder()
         .application(app)
         .title(crate::i18n::t("voice_call"))
+        .icon_name("line-gtk")
         .default_width(380)
         .default_height(560)
         .resizable(false)
@@ -57,19 +63,10 @@ pub fn open_call_window(
         .css_classes(["line-call-window"])
         .build();
 
-    let avatar = gtk::Label::builder()
-        .label(
-            peer_name
-                .chars()
-                .next()
-                .map(|c| c.to_uppercase().to_string())
-                .unwrap_or_else(|| "?".into()),
-        )
-        .halign(gtk::Align::Center)
-        .valign(gtk::Align::Center)
-        .css_classes(["line-call-avatar"])
-        .build();
-    avatar.set_size_request(96, 96);
+    let avatar = libadwaita::Avatar::new(96, Some(peer_name), true);
+    avatar.set_halign(gtk::Align::Center);
+    avatar.set_valign(gtk::Align::Center);
+    avatar.add_css_class("line-call-avatar");
 
     let peer_label = gtk::Label::builder()
         .label(peer_name)
@@ -105,6 +102,11 @@ pub fn open_call_window(
         .homogeneous(false)
         .css_classes(["line-call-vol-row"])
         .build();
+    let mic_icon = gtk::Image::builder()
+        .icon_name("audio-input-microphone-symbolic")
+        .pixel_size(16)
+        .css_classes(["dim-label"])
+        .build();
     let mic_lab = gtk::Label::builder()
         .label(crate::i18n::t("call_mic_vol"))
         .xalign(0.0)
@@ -118,6 +120,7 @@ pub fn open_call_window(
     mic_vol_scale.set_draw_value(true);
     mic_vol_scale.set_value_pos(gtk::PositionType::Right);
     mic_vol_scale.set_digits(2);
+    mic_row.append(&mic_icon);
     mic_row.append(&mic_lab);
     mic_row.append(&mic_vol_scale);
 
@@ -126,6 +129,11 @@ pub fn open_call_window(
         .spacing(8)
         .homogeneous(false)
         .css_classes(["line-call-vol-row"])
+        .build();
+    let spk_icon = gtk::Image::builder()
+        .icon_name("audio-volume-high-symbolic")
+        .pixel_size(16)
+        .css_classes(["dim-label"])
         .build();
     let spk_lab = gtk::Label::builder()
         .label(crate::i18n::t("call_spk_vol"))
@@ -140,6 +148,7 @@ pub fn open_call_window(
     spk_vol_scale.set_draw_value(true);
     spk_vol_scale.set_value_pos(gtk::PositionType::Right);
     spk_vol_scale.set_digits(2);
+    spk_row.append(&spk_icon);
     spk_row.append(&spk_lab);
     spk_row.append(&spk_vol_scale);
 
@@ -214,9 +223,9 @@ pub fn open_call_window(
     window.set_content(Some(&root));
     window.present();
 
-    CallUi {
+    let ui = CallUi {
         window,
-        avatar_label: avatar,
+        avatar,
         peer_label,
         status_label,
         timer_label,
@@ -231,8 +240,66 @@ pub fn open_call_window(
         in_box,
         connected_at: Rc::new(RefCell::new(None)),
         tick: Rc::new(RefCell::new(None)),
+        avatar_path: Rc::new(RefCell::new(None)),
+        avatar_gen: Rc::new(Cell::new(0)),
         hangup_guard: Rc::new(RefCell::new(false)),
+    };
+    set_peer_avatar(&ui, peer_name, avatar_path);
+    ui
+}
+
+pub fn set_peer_avatar(ui: &CallUi, peer_name: &str, avatar_path: Option<&str>) {
+    ui.avatar.set_text(Some(peer_name));
+    let next_path = avatar_path
+        .map(str::trim)
+        .filter(|path| !path.is_empty() && Path::new(path).is_file())
+        .map(str::to_string);
+    if *ui.avatar_path.borrow() == next_path {
+        return;
     }
+    *ui.avatar_path.borrow_mut() = next_path.clone();
+    let generation = ui.avatar_gen.get().wrapping_add(1);
+    ui.avatar_gen.set(generation);
+
+    let Some(path) = next_path else {
+        ui.avatar.set_custom_image(gdk::Paintable::NONE);
+        return;
+    };
+
+    let (tx, rx) = async_channel::bounded::<Option<crate::sticker_anim::AnimFrames>>(1);
+    std::thread::spawn(move || {
+        let _ = tx.send_blocking(crate::sticker_anim::load_scaled(&path, 192, false));
+    });
+    let avatar = ui.avatar.clone();
+    let current_gen = ui.avatar_gen.clone();
+    glib::spawn_future_local(async move {
+        if current_gen.get() != generation {
+            return;
+        }
+        let Ok(Some(frames)) = rx.recv().await else {
+            return;
+        };
+        if current_gen.get() != generation {
+            return;
+        }
+        if let Some(frame) = frames.frames.into_iter().next()
+            && frame.width > 0
+            && frame.height > 0
+        {
+            let stride = (frame.width as usize).saturating_mul(4);
+            if frame.rgba.len() >= stride.saturating_mul(frame.height as usize) {
+                let bytes = glib::Bytes::from_owned(frame.rgba);
+                let texture = gdk::MemoryTexture::new(
+                    frame.width,
+                    frame.height,
+                    gdk::MemoryFormat::R8g8b8a8,
+                    &bytes,
+                    stride,
+                );
+                avatar.set_custom_image(Some(&texture));
+            }
+        }
+    });
 }
 
 pub fn set_outgoing_mode(ui: &CallUi, status: &str) {
